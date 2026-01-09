@@ -1,0 +1,769 @@
+---
+title: "Activity validation"
+output:
+  html_document: default
+date: "2025-12-21"
+---
+
+
+
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = FALSE,warning=F,message=F,error=F,cache=F,fig.height = 5,fig.width = 11)
+
+library(factoextra)
+library(readxl)
+library(multcomp)
+library(caret)
+library(tibble)
+library(mgcv)
+library(emmeans)
+library(patchwork)
+library(plotly)
+library(ggplot2)
+library(dendextend)
+library(ggsci)
+library(tidyr)
+library(data.table)
+library(dplyr)
+library(ggbeeswarm)
+library(ggprism)
+library(sgpv)
+library(robustlmm)
+library(glmmTMB)
+library(RColorBrewer)
+library(see)
+library(ggpattern)
+library(MASS)
+library(geomtextpath)
+
+
+
+```
+
+# Section {.tabset}
+
+
+
+```{r, include=FALSE}
+
+setwd("~/")
+
+
+params = read_excel("activity_parameters_awaketoasleep.xlsx")
+
+params = na.omit(params)
+parms = tolower(params$...3)
+
+file_path = "~/MiMIC"
+
+MiMIC = TRUE
+Trojan = FALSE
+
+# Colors can be set here
+
+if(MiMIC){
+  custom_colors =   custom_colors = rep(c( "#737373","#e7cdb4" ),2)
+}
+
+if(Trojan){
+  custom_colors = rep(c( "#737373", "#94c8c9"),2)
+}
+
+
+files = list.files(file_path,pattern = ".*.xlsx")
+
+df=NULL
+for(i in files){
+  combine = NULL
+  for(j in 1:length(excel_sheets( paste0(file_path,"/",i)))){
+      tmp = read_excel( paste0(file_path,"/",i),sheet=j)
+      colnames(tmp) = make.names(colnames(tmp))
+      colnames(tmp)[which(substr(tolower(colnames(tmp)),1,3)=="fly")] = "Fly.Number"
+      Measure = excel_sheets( paste0(file_path,"/",i))[j] 
+      colnames(tmp)[5:ncol(tmp)] = paste0(Measure,colnames(tmp)[5:ncol(tmp)])
+      tmp = tmp[,! colnames(tmp) %in% c("Bin.Length","Bin Length")]
+      if(j == 1){
+        combine = tmp
+      }  else {
+        combine = merge(combine,tmp,by=c("Group","Replicate","Fly.Number"))
+      }
+    }
+  combine$file = i
+  df = rbind(df,combine)
+}
+
+df = df[! df$Fly.Number %in% c( "Average" ,"SEM"), ]
+df[is.na(df)] = 0
+sds = apply(df[4:(ncol(df)-1)], 2, function(x) sd(x))
+ix = which(!is.na(sds))
+
+df = df[grepl("MGD",fixed=T,df$Group),]
+
+colnames(df) = gsub("X","",colnames(df))
+
+```
+
+
+```{r,include=F}
+
+fixed = gsub("X24","24",gsub("X12","12",gsub("Bin","",gsub("2nd","12h2",gsub("1st","12h1",gsub("BinAVG","",gsub("\\..*","",gsub("\\.bin","",gsub("\\.hour\\.bin","",colnames(df))))))))))
+
+matched = sapply(parms, function(p) which(grepl(p ,fixed=T, tolower(fixed)) ))
+
+#Hard coding for convenience, double check that 247 is file, 1:3 are group, replicate, and fly number
+
+# df = df[,c(1:3,matched,247)]
+
+sds = apply(df[4:(ncol(df)-1)], 2, function(x) sd(x))
+ix = which(!is.na(sds))
+
+```
+
+
+```{r,fig.height = 6,fig.width=18}
+
+df$Replicate = paste0(df$Group,df$Replicate,df$file)
+df$Diet = sapply(strsplit(df$Group,"-"),function(x) x[[2]]) # leaving this logic in for future use
+df$Genotype = sapply(strsplit(df$Group,"-"),function(x) x[[1]])
+df$Sex = sapply(strsplit(df$Group,"-"),function(x) x[[3]])
+
+convert = read_excel("screen_gene_names (2).xlsx")
+# convert = read_excel("/Users/Ellen.Stirtz/OneDrive - Van Andel Institute/thesis/GxE/screen_gene_names.xlsx")
+
+
+names = convert$`Drosophila Ortholog`[ match(unique(df$Genotype[df$Genotype != "WT"]),convert$`Bloomington Number` )]
+
+names[is.na(names)] = unique(df$Genotype[df$Genotype != "WT"])[is.na(names)]
+
+names = gsub("-",".",names)
+
+df$Genotype = factor(df$Genotype,levels=c("WT",unique(as.character(df$Genotype[df$Genotype != "WT"]))),labels = c("WT", names))
+
+# For every genotype and sex, 
+# we fit a PCA
+# apply rotation matrix to controls
+# analyze controls for null interval
+# analyze mutants to see if 95% CI does not overlap control effects
+
+res = NULL
+
+gns = unique(df$Genotype) 
+gns = as.character(gns[gns != "WT" & ! grepl( "Ctrl",fixed=T, gns)] )
+
+fixed2 = gsub("X24","24",gsub("X12","12",gsub("Bin","",gsub("2nd","12h2",gsub("1st","12h1",gsub("BinAVG","",gsub("\\..*","",gsub("\\.bin","",gsub("\\.hour\\.bin","",colnames(df))))))))))
+
+```
+
+```{r}
+
+matched2 = sapply(parms, function(p) which(grepl(p ,fixed=T, tolower(fixed2)) ))
+# matched2 = colnames(df)[4:(ncol(df)-4)]
+
+```
+
+
+```{r}
+#Rose plot logic
+
+# Light/Dark outcomes
+outcomes_ld <- params$`...3`[
+  grepl("light", params$Description, fixed = TRUE) |
+    grepl("dark",  params$Description, fixed = TRUE)
+]
+
+# Start with the explicit 24h tags
+outcomes_24_explicit <- params$`...3`[
+  grepl("24h",     params$Description, fixed = TRUE) |
+    grepl("24 hr",   params$Description, fixed = TRUE) |
+    grepl("24-hour", params$Description, fixed = TRUE) |
+    grepl("overall", params$Description, fixed = TRUE) |
+    grepl("daily",   params$Description, fixed = TRUE)
+]
+
+# If you don't have explicit 24h tags, define 24h as "everything NOT LD"
+if (length(outcomes_24_explicit) == 0) {
+  outcomes_24 <- setdiff(params$`...3`, outcomes_ld)
+} else {
+  # If you do have explicit tags, STILL enforce exclusivity
+  outcomes_24 <- setdiff(outcomes_24_explicit, outcomes_ld)
+}
+
+rose_plot <- function(res_indv, sex, diet, outcomes, mode = c("24h", "ld")) {
+  mode <- match.arg(mode)
+  
+  new.names <- gsub("Bin","",gsub("2nd","12h2",gsub("1st","12h1",
+                                                    gsub("BinAVG","",gsub("\\..*","",gsub("\\.bin","",
+                                                                                          gsub("\\.hour\\.bin","",res_indv$Outcome)))))))
+  
+  match.indv <- unlist(sapply(tolower(new.names), function(p) which(grepl(p, fixed=TRUE, parms))))
+  res_indv$names <- parms[match.indv]
+  
+  res_indv$light <- ifelse(grepl("12h1", fixed=TRUE, res_indv$names),"Light",
+                           ifelse(grepl("12h2", fixed=TRUE, res_indv$names),"Dark","24h"))
+  
+  res_indv$Outcome <- res_indv$names
+  
+  plot_data <- subset(res_indv[res_indv$Sex == sex,], select = c(Outcome, estimate, p.value, light))
+  plot_data <- plot_data[plot_data$Outcome %in% outcomes,]
+  
+  # MODE filter (this is the key feature you wanted)
+  if (mode == "24h") {
+    plot_data <- subset(plot_data, light == "24h")
+  } else {
+    plot_data <- subset(plot_data, light %in% c("Light","Dark"))
+  }
+  
+  if (nrow(plot_data) == 0) {
+    message("No rows for sex=", sex, " mode=", mode, " after filtering.")
+    return(invisible(NULL))
+  }
+  
+  plot_data$direction <- ifelse(plot_data$estimate < 0,"Down","Up")
+  plot_data$ratio <- 2^abs(plot_data$estimate)
+  plot_data$time_direction <- paste0(plot_data$direction," (",plot_data$light,")")
+  plot_data$time_direction[plot_data$time_direction == "NA (NA)"] <- NA
+  plot_data$ratio[plot_data$ratio > 3] <- 3
+  
+  plot_data$Outcome <- factor(plot_data$Outcome)
+  plot_data$Outcome <- gsub("_.*","", params$`MORE ACTIVE`[match(plot_data$Outcome, params$...3)])
+  lvls <- unique(plot_data$Outcome)
+  
+  plot_data <- plot_data[order(plot_data$Outcome, plot_data$light),]
+  
+  empty_bar <- 2
+  to_add <- data.frame(matrix(NA, empty_bar*nlevels(plot_data$Outcome), ncol(plot_data)))
+  colnames(to_add) <- colnames(plot_data)
+  to_add$Outcome <- rep(levels(plot_data$Outcome), each=empty_bar)
+  
+  plot_data <- rbind(plot_data, to_add) %>% arrange(Outcome, light)
+  
+  label_data <- plot_data %>% group_by(Outcome) %>% summarize(tot=max(ratio,na.rm=TRUE), .groups="drop")
+  number_of_bar <- nrow(label_data)
+  angle <- 90 - 360 * (as.numeric(factor(label_data$Outcome,levels=lvls))-0.5) / number_of_bar
+  label_data$hjust <- ifelse(angle < -90, 1, 0)
+  label_data$angle <- ifelse(angle < -90, angle+180, angle)
+  
+  plot_data$Outcome <- factor(plot_data$Outcome, levels=lvls)
+  
+  base_data <- plot_data %>% group_by(Outcome) %>%
+    summarize(start=min(as.numeric(as.factor(Outcome))), end=max(as.numeric(as.factor(Outcome))), .groups="drop") %>%
+    rowwise() %>% mutate(title=mean(c(start,end)))
+  
+  grid_data <- base_data
+  grid_data$end <- grid_data$end[c(nrow(grid_data), 1:nrow(grid_data)-1)] + 1
+  grid_data$start <- grid_data$start - 1
+  grid_data <- grid_data[-1,]
+  
+  if (plot_data$light[1] == "24h") {
+    plot_data$time_direction <- factor(plot_data$time_direction, levels=c("Up (24h)","Down (24h)"))
+  } else {
+    plot_data$time_direction <- factor(plot_data$time_direction,
+                                       levels=c("Up (Dark)","Down (Dark)","Up (Light)","Down (Light)"))
+  }
+  
+  p.hold <- ggplot(plot_data, aes(x=as.factor(Outcome), y=ratio, fill=time_direction, color=time_direction)) +
+    geom_bar(stat="identity", position=position_dodge(width=0.85), width=0.5) +
+    geom_segment(data=grid_data, aes(x=end, y=2, xend=start, yend=2),
+                 colour="gray", linewidth=0.3, inherit.aes=FALSE) +
+    geom_segment(data=grid_data, aes(x=end, y=1, xend=start, yend=1),
+                 colour="gray", linewidth=0.3, inherit.aes=FALSE) +
+    geom_segment(data=grid_data, aes(x=end, y=0, xend=start, yend=0),
+                 colour="gray", linewidth=0.3, inherit.aes=FALSE) +
+    annotate("text", x=rep(min(as.numeric(plot_data$Outcome))-0.3,3), y=c(0,1,2),
+             label=c("1","2","3+"), color="grey30", size=7, hjust=1) +
+    coord_polar(start=0, clip="off") +
+    theme_minimal(12) + ylim(c(-0.5,4)) +
+    theme(legend.position="bottom", axis.text=element_blank(), axis.title=element_blank(),
+          panel.grid=element_blank(), plot.margin=unit(rep(0,4),"cm")) +
+    geom_text(data=label_data, aes(x=Outcome,label=Outcome,hjust=hjust,angle=angle),
+              y=0.5, color="black", size=0, angle=label_data$angle, inherit.aes=FALSE)
+  
+  if (plot_data$light[1] == "24h") {
+    p.hold <- p.hold +
+      scale_color_manual(values=c("Down (24h)"="white","Up (24h)"="white"), na.translate=FALSE) +
+      scale_fill_manual(values=c("Down (24h)"=alpha("darkblue",0.3),
+                                 "Up (24h)"=alpha("darkred",0.3)), na.translate=FALSE) +
+      theme(legend.title=element_blank())
+  } else {
+    p.hold <- p.hold +
+      scale_color_manual(values=c("Down (Dark)"="darkblue","Down (Light)"="darkblue",
+                                  "Up (Dark)"="darkred","Up (Light)"="darkred"), na.translate=FALSE) +
+      scale_fill_manual(values=c("Down (Dark)"=alpha("darkblue",0.3),
+                                 "Down (Light)"="white",
+                                 "Up (Dark)"=alpha("darkred",0.3),
+                                 "Up (Light)"="white"), na.translate=FALSE) +
+      theme(legend.title=element_blank())
+  }
+  
+  print(p.hold)
+  invisible(p.hold)
+}
+
+
+
+```
+
+
+
+
+## Males {.tabset}
+### Individual genes
+
+Loadings are identical to the full screen as we're using the same rotation matrix, they are printed here again for convenience. Rotation matrix was preserved so we can ensure we're validating the same signal. 
+
+
+```{r, fig.width = 16,fig.height=6}
+sex="M"
+
+xx <- preProcess(df[df$Sex == sex  ,matched2], method = "YeoJohnson")
+df_yj <- predict(xx, df[df$Sex == sex  ,matched2])
+
+load("male_pca.rda")
+
+res.full = read.csv(file="activity_males.csv")
+
+res.full = res.full[res.full$Genotype=="dom",]
+
+factoextra::fviz_eig(pca,ncp=15)
+
+fviz_contrib(pca, choice = "var", axes = 1, top = 15)+coord_flip() + xlab("")
+fviz_contrib(pca, choice = "var", axes = 2, top = 15)+coord_flip() + xlab("")
+fviz_contrib(pca, choice = "var", axes = 3, top = 15)+coord_flip() + xlab("")
+fviz_contrib(pca, choice = "var", axes = 4, top = 15)+coord_flip() + xlab("")
+fviz_contrib(pca, choice = "var", axes = 5, top = 15)+coord_flip() + xlab("")
+fviz_contrib(pca, choice = "var", axes = 6, top = 15)+coord_flip() + xlab("")
+
+
+fit.p = list()
+for(p in 1:6){    
+    pc = as.data.frame(predict(pca, df_yj))
+    pc$Genotype = df[df$Sex == sex  ,]$Genotype
+    pc$file = factor(df[df$Sex == sex  ,]$file)
+    pc$ID = factor(paste0(df[df$Sex == sex  ,]$Diet,df[df$Sex == sex  ,]$Replicate,df[df$Sex == sex  ,]$Genotype,df[df$Sex == sex  ,]$file))
+    
+    colnames(pc)[which(colnames(pc) == paste0("PC",p))] = "PCX"
+    
+    fit.p[[p]] = lme(PCX ~ Genotype, random=~1|file/ID,data=pc,weights = varIdent(form = ~1|Genotype),method="ML",control = lmeControl(msMaxIter = 500, msMaxEval = 500))
+    
+}
+
+
+res.tmp=NULL
+plots.dist = list()
+plots.pc = list()
+gns = unique(df$Genotype[df$Genotype != "WT"])
+  
+for(i in gns){
+  print(i)
+  for(f in 1:6){
+      pc = as.data.frame(predict(pca, df_yj))
+      pc$Genotype = df[df$Sex == sex  ,]$Genotype
+      pc$file = factor(df[df$Sex == sex  ,]$file)
+      plot.data=pc[ pc$Genotype %in% c("WT",i),]
+      colnames(plot.data)[colnames(plot.data) == paste0("PC",f)] = "PCX"
+      plot.data$Genotype = factor(plot.data$Genotype,levels=c("WT",i))
+      
+      fit = fit.p[[f]]
+    
+      g.ix = which(names(summary(fit)$coeff$fixed) == paste0("Genotype",i))
+      ctrl.ixs = which(names(summary(fit)$coeff$fixed) != paste0("Genotype",i))[-1] # drop the intercept, we only want the non i genotype coeffs
+          
+      ctrl.contr = rep(-1/length(ctrl.ixs), length(ctrl.ixs))
+      contrast = rep(1,length(summary(fit)$coeff$fixed))
+      contrast[1] = 0 #We don't care about the WT mean aka the intercept
+      contrast[ctrl.ixs] = ctrl.contr
+      contrast[g.ix] = 1
+      mean.c = abs(contrast) 
+      mean.c[g.ix] = 0
+      int = c(1,rep(0,length(mean.c)-1))
+      v.WT = int
+      v.WT[g.ix] = 1
+      v.WT[1] = -1
+      L <- list(v.WT,int)
+    
+      res = merge(confint(emmeans(fit, "Genotype") |>
+        contrast(lapply(1,function(x) L[[x]]))),
+        emmeans(fit, "Genotype") |>
+        contrast(lapply(1,function(x) L[[x]])))
+        
+      mus = confint(emmeans(fit, "Genotype") |>
+        contrast(lapply(2,function(x) L[[x]])))
+      
+      res$contrast = c(paste0(i, " vs WT"))
+      
+      plots.pc[[f]] = ggplot(plot.data,aes(x=Genotype,y=PCX,color = Genotype)) +
+        geom_quasirandom()+theme_prism()+
+        geom_boxplot(fill=NA,outliers = F)+ylab(paste0("PC",f)) +
+        theme(strip.background = element_blank())+
+        scale_color_manual(values=custom_colors )
+                            
+       if(res$p.value < 0.05){
+            label = case_when(res$p.value<0.001 ~ "***",
+            res$p.value<0.01 ~ "**",
+            res$p.value<0.05 ~ "*")
+            
+            y <- max(plot.data$PCX)
+            plots.pc[[f]] = plots.pc[[f]] + 
+              annotate(geom="line",x = c(1,1.35),y = rep(y*1.15,2)) +
+              annotate(geom="line",x = c(1.65,2),y = rep(y*1.15,2)) +
+              annotate(geom="text",x=1.5,y=1.15*y,label=label,size=8,color="black",vjust=0.8)
+
+
+       }
+      res.tmp = rbind(res.tmp,data.frame(Genotype = i, p = paste0("PC",f),res))
+  }
+    # print(wrap_plots(plots.dist) + plot_layout(ncol=6, guides="collect" ))
+    print(wrap_plots(plots.pc) + plot_layout(ncol=6, guides="collect" ))
+}
+    
+res.tmp$Sex = "Male"
+
+res.tmp$Result = case_when(res.tmp$p.value < 0.05 ~ "Difference",
+                           TRUE~"Inconclusive") 
+
+
+```
+
+
+### Individual 
+Must choose genotype(s)
+
+```{r}
+
+res.indv.m=NULL
+#Add more genotypes here to get more individual analysis with rose plots
+for(i in c("dom")){
+  ix = which(colnames(df) %in% c("Genotype","file","Replicate"))
+  
+  for(p in names(matched2)){
+    indv.mut = df[df$Sex == sex,c(matched2,ix)]
+    indv.mut$ID = paste0(indv.mut$Genotype,indv.mut$file,indv.mut$Replicate)
+    colnames(indv.mut)[1:51] = names(matched2)
+    
+    colnames(indv.mut)[colnames(indv.mut) == p] = "VarX"
+    
+    if(any(indv.mut$VarX<=0)){
+      indv.mut$VarX = indv.mut$VarX + abs(min(indv.mut$VarX,na.rm=T)) + abs(min(indv.mut$VarX,na.rm=T))[abs(min(indv.mut$VarX,na.rm=T))>0]*0.1
+    }
+    
+    fit = lme(log2(VarX) ~ Genotype, random= ~1|ID,data=indv.mut,weights = varIdent(form = ~1|Genotype),method="ML",control = lmeControl(msMaxIter = 500, msMaxEval = 500,opt = "optim"))
+    
+    g.ix = which(names(summary(fit)$coeff$fixed) == paste0("Genotype",i))
+    ctrl.ixs = which(names(summary(fit)$coeff$fixed) != paste0("Genotype",i))[-1] # drop the intercept, we only want the non i genotype coeffs
+    
+    ctrl.contr = rep(-1/length(ctrl.ixs), length(ctrl.ixs))
+    contrast = rep(1,length(summary(fit)$coeff$fixed))
+    contrast[1] = 0 #We don't care about the WT mean aka the intercept
+    contrast[ctrl.ixs] = ctrl.contr
+    contrast[g.ix] = 1
+    mean.c = abs(contrast)
+    mean.c[g.ix] = 0
+    int = c(1,rep(0,length(mean.c)-1))
+    v.WT = int
+    v.WT[g.ix] = 1
+    v.WT[1] = -1
+    L <- list(v.WT, int)
+    
+    
+    res = merge(confint(emmeans(fit, "Genotype") |>
+        contrast(lapply(1,function(x) L[[x]]))),
+        emmeans(fit, "Genotype") |>
+        contrast(lapply(1,function(x) L[[x]])))
+        
+    mus = confint(emmeans(fit, "Genotype") |>
+                    contrast(lapply(2,function(x) L[[x]])))
+    res$contrast = c(paste0(p, " vs WT"))
+    
+    
+    
+    res.indv.m=rbind(res.indv.m,data.frame(Genotype = i , Sex = sex, Outcome = p,res))
+  }
+}
+
+
+
+write.csv(res.indv.m,file=paste0(file_path,"/",ifelse(MiMIC,"MiMIC","Trojan")  ,"individual_outcome_res_male.csv"))
+
+pdf(paste0(ifelse(MiMIC,"MiMIC","Trojan"),"/bchs_rose_plots_combined_males_.pdf") , width=15, height=15)
+rose_plot(res.indv.m, "M", "CSD", outcomes_24, mode="24h")
+rose_plot(res.indv.m, "M", "CSD", outcomes_ld, mode="ld")
+dev.off()
+
+```
+
+
+
+### Table
+
+
+```{r}
+
+DT::datatable(res.tmp)
+
+write.csv(res.tmp,file=paste0(file_path,"/",ifelse(MiMIC,"MiMIC","Trojan") ,"male_activity_validation.csv"))
+
+
+```
+
+
+### Forest plot
+
+
+
+```{r,fig.width = 5,fig.height=5.5}
+
+res.tmp$PC = factor(res.tmp$p,levels=c("PC1","PC2","PC3","PC4","PC5","PC6"))
+
+counts = aggregate(I(Result == "Difference") ~ Genotype,data=res.tmp,sum)
+colnames(counts)[2] = "counts"
+res.tmp = merge(res.tmp, counts,by="Genotype")
+
+res.tmp$PC = factor(res.tmp$PC,levels=(unique(res.tmp$PC)))
+res.tmp$counts = factor(res.tmp$counts)
+
+
+ggplot(res.tmp, aes(y = estimate, x= p,color=Result)) + 
+  geom_point(size=3) + geom_errorbar(aes(ymin = lower.CL,ymax=upper.CL),width=0.1) +      coord_flip() +theme_prism() + xlab("")+
+  ylab("Mean difference") + ggtitle(i) + 
+  geom_hline(yintercept = 0,linetype="dotted",color="grey",linewidth=1.5) + 
+  scale_color_manual(values = c(Inconclusive = "black",Difference = "red"))
+
+
+
+```
+
+
+
+## Females {.tabset}
+### Individual genes
+
+Loadings are identical to the full screen as we're using the same rotation matrix, they are printed here again for convenience. Rotation matrix was preserved so we can ensure we're validating the same signal. 
+
+
+```{r, fig.width = 16,fig.height=6}
+sex="F"
+
+xx <- preProcess(df[df$Sex == sex  ,matched2], method = "YeoJohnson")
+df_yj <- predict(xx, df[df$Sex == sex  ,matched2])
+
+load("female_pca.rda")
+
+res.full = read.csv(file="activity_females.csv")
+
+
+res.full = res.full[res.full$Genotype=="dom",]
+
+factoextra::fviz_eig(pca,ncp=15)
+
+fviz_contrib(pca, choice = "var", axes = 1, top = 15)+coord_flip() + xlab("")
+fviz_contrib(pca, choice = "var", axes = 2, top = 15)+coord_flip() + xlab("")
+fviz_contrib(pca, choice = "var", axes = 3, top = 15)+coord_flip() + xlab("")
+fviz_contrib(pca, choice = "var", axes = 4, top = 15)+coord_flip() + xlab("")
+fviz_contrib(pca, choice = "var", axes = 5, top = 15)+coord_flip() + xlab("")
+fviz_contrib(pca, choice = "var", axes = 6, top = 15)+coord_flip() + xlab("")
+
+
+fit.p = list()
+for(p in 1:6){    
+  pc = as.data.frame(predict(pca, df_yj))
+  pc$Genotype = df[df$Sex == sex  ,]$Genotype
+  pc$file = factor(df[df$Sex == sex  ,]$file)
+  pc$ID = factor(paste0(df[df$Sex == sex  ,]$Diet,df[df$Sex == sex  ,]$Replicate,df[df$Sex == sex  ,]$Genotype,df[df$Sex == sex  ,]$file))
+  
+  colnames(pc)[which(colnames(pc) == paste0("PC",p))] = "PCX"
+  
+  fit.p[[p]] = lme(PCX ~ Genotype, random=~1|file/ID,data=pc,weights = varIdent(form = ~1|Genotype),method="ML",control = lmeControl(msMaxIter = 500, msMaxEval = 500))
+  
+}
+
+
+res.tmp=NULL
+plots.dist = list()
+plots.pc = list()
+gns = unique(df$Genotype[df$Genotype != "WT"])
+
+for(i in gns){
+  print(i)
+  for(f in 1:6){
+    pc = as.data.frame(predict(pca, df_yj))
+    pc$Genotype = df[df$Sex == sex  ,]$Genotype
+    pc$file = factor(df[df$Sex == sex  ,]$file)
+    plot.data=pc[ pc$Genotype %in% c("WT",i),]
+    colnames(plot.data)[colnames(plot.data) == paste0("PC",f)] = "PCX"
+    plot.data$Genotype = factor(plot.data$Genotype,levels=c("WT",i))
+    
+    fit = fit.p[[f]]
+    
+    g.ix = which(names(summary(fit)$coeff$fixed) == paste0("Genotype",i))
+    ctrl.ixs = which(names(summary(fit)$coeff$fixed) != paste0("Genotype",i))[-1] # drop the intercept, we only want the non i genotype coeffs
+    
+    ctrl.contr = rep(-1/length(ctrl.ixs), length(ctrl.ixs))
+    contrast = rep(1,length(summary(fit)$coeff$fixed))
+    contrast[1] = 0 #We don't care about the WT mean aka the intercept
+    contrast[ctrl.ixs] = ctrl.contr
+    contrast[g.ix] = 1
+    mean.c = abs(contrast) 
+    mean.c[g.ix] = 0
+    int = c(1,rep(0,length(mean.c)-1))
+    v.WT = int
+    v.WT[g.ix] = 1
+    v.WT[1] = -1
+    L <- list(v.WT,int)
+    
+    res = merge(confint(emmeans(fit, "Genotype") |>
+                          contrast(lapply(1,function(x) L[[x]]))),
+                emmeans(fit, "Genotype") |>
+                  contrast(lapply(1,function(x) L[[x]])))
+    
+    mus = confint(emmeans(fit, "Genotype") |>
+                    contrast(lapply(2,function(x) L[[x]])))
+    
+    res$contrast = c(paste0(i, " vs WT"))
+    
+    plots.pc[[f]] = ggplot(plot.data,aes(x=Genotype,y=PCX,color = Genotype)) +
+      geom_quasirandom()+theme_prism()+
+      geom_boxplot(fill=NA,outliers = F)+ylab(paste0("PC",f)) +
+      theme(strip.background = element_blank())+
+      scale_color_manual(values=custom_colors )
+    
+    if(res$p.value < 0.05){
+      label = case_when(res$p.value<0.001 ~ "***",
+                        res$p.value<0.01 ~ "**",
+                        res$p.value<0.05 ~ "*")
+      
+      y <- max(plot.data$PCX)
+      plots.pc[[f]] = plots.pc[[f]] + 
+        annotate(geom="line",x = c(1,1.35),y = rep(y*1.15,2)) +
+        annotate(geom="line",x = c(1.65,2),y = rep(y*1.15,2)) +
+        annotate(geom="text",x=1.5,y=1.15*y,label=label,size=8,color="black",vjust=0.8)
+      
+      
+    }
+    res.tmp = rbind(res.tmp,data.frame(Genotype = i, p = paste0("PC",f),res))
+  }
+  # print(wrap_plots(plots.dist) + plot_layout(ncol=6, guides="collect" ))
+  print(wrap_plots(plots.pc) + plot_layout(ncol=6, guides="collect" ))
+}
+
+res.tmp$Sex = "Female"
+
+res.tmp$Result = case_when(res.tmp$p.value < 0.05 ~ "Difference",
+                           TRUE~"Inconclusive") 
+
+
+```
+
+
+### Individual 
+Must choose genotype(s)
+
+```{r}
+
+res.indv.f=NULL
+#Add more genotypes here to get more individual analysis with rose plots
+for(i in c("dom")){
+  ix = which(colnames(df) %in% c("Genotype","file","Replicate"))
+  
+  for(p in names(matched2)){
+    indv.mut = df[df$Sex == sex,c(matched2,ix)]
+    indv.mut$ID = paste0(indv.mut$Genotype,indv.mut$file,indv.mut$Replicate)
+    colnames(indv.mut)[1:51] = names(matched2)
+    
+    colnames(indv.mut)[colnames(indv.mut) == p] = "VarX"
+    
+    if(any(indv.mut$VarX<=0)){
+      indv.mut$VarX = indv.mut$VarX + abs(min(indv.mut$VarX,na.rm=T)) + abs(min(indv.mut$VarX,na.rm=T))[abs(min(indv.mut$VarX,na.rm=T))>0]*0.1
+    }
+    
+    fit = lme(log2(VarX) ~ Genotype, random= ~1|ID,data=indv.mut,weights = varIdent(form = ~1|Genotype),method="ML",control = lmeControl(msMaxIter = 500, msMaxEval = 500,opt = "optim"))
+    
+    g.ix = which(names(summary(fit)$coeff$fixed) == paste0("Genotype",i))
+    ctrl.ixs = which(names(summary(fit)$coeff$fixed) != paste0("Genotype",i))[-1] # drop the intercept, we only want the non i genotype coeffs
+    
+    ctrl.contr = rep(-1/length(ctrl.ixs), length(ctrl.ixs))
+    contrast = rep(1,length(summary(fit)$coeff$fixed))
+    contrast[1] = 0 #We don't care about the WT mean aka the intercept
+    contrast[ctrl.ixs] = ctrl.contr
+    contrast[g.ix] = 1
+    mean.c = abs(contrast)
+    mean.c[g.ix] = 0
+    int = c(1,rep(0,length(mean.c)-1))
+    v.WT = int
+    v.WT[g.ix] = 1
+    v.WT[1] = -1
+    L <- list(v.WT, int)
+    
+    
+    res = merge(confint(emmeans(fit, "Genotype") |>
+                          contrast(lapply(1,function(x) L[[x]]))),
+                emmeans(fit, "Genotype") |>
+                  contrast(lapply(1,function(x) L[[x]])))
+    
+    mus = confint(emmeans(fit, "Genotype") |>
+                    contrast(lapply(2,function(x) L[[x]])))
+    res$contrast = c(paste0(p, " vs WT"))
+    
+    
+    
+    res.indv.f=rbind(res.indv.f,data.frame(Genotype = i , Sex = sex, Outcome = p,res))
+  }
+}
+
+
+
+write.csv(res.indv.f,file=paste0(file_path,"/",ifelse(MiMIC,"MiMIC","Trojan")  ,"individual_outcome_res_female.csv"))
+
+pdf(pdf(paste0(ifelse(MiMIC,"MiMIC","Trojan"),"/bchs_rose_plots_combined_females_.pdf") , width=15, height=15), width=15, height=15)
+rose_plot(res.indv.f, "F", "CSD", outcomes_24, mode="24h")
+rose_plot(res.indv.f, "F", "CSD", outcomes_ld, mode="ld")
+dev.off()
+
+```
+
+
+
+
+
+
+### Table
+
+
+```{r}
+
+DT::datatable(res.tmp)
+
+write.csv(res.tmp,file=paste0(file_path,"/",ifelse(MiMIC,"MiMIC","Trojan") ,"female_activity_validation.csv"))
+
+
+
+```
+
+
+### Forest plot
+
+
+
+```{r,fig.width = 5,fig.height=5.5}
+
+res.tmp$PC = factor(res.tmp$p,levels=c("PC1","PC2","PC3","PC4","PC5","PC6"))
+
+counts = aggregate(I(Result == "Difference") ~ Genotype,data=res.tmp,sum)
+colnames(counts)[2] = "counts"
+res.tmp = merge(res.tmp, counts,by="Genotype")
+
+res.tmp$PC = factor(res.tmp$PC,levels=(unique(res.tmp$PC)))
+res.tmp$counts = factor(res.tmp$counts)
+
+
+ggplot(res.tmp, aes(y = estimate, x= p,color=Result)) + 
+  geom_point(size=3) + geom_errorbar(aes(ymin = lower.CL,ymax=upper.CL),width=0.1) +      coord_flip() +theme_prism() + xlab("")+
+  ylab("Mean difference") + ggtitle(i) + 
+  geom_hline(yintercept = 0,linetype="dotted",color="grey",linewidth=1.5) + 
+  scale_color_manual(values = c(Inconclusive = "black",Difference = "red"))
+
+
+
+```
+

@@ -1,0 +1,1229 @@
+---
+title: "Full screen V3"
+output:
+  html_document: default
+  pdf_document: default
+date: "2025-05-06"
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,warnings=F,messages=F,errors=F,cache=F,fig.height = 5,fig.width = 16)
+library(readxl)
+library(mgcv)
+library(emmeans)
+library(patchwork)
+library(ggplot2)
+library(dendextend)
+library(ggsci)
+library(tidyr)
+library(data.table)
+library(dplyr)
+library(ggbeeswarm)
+library(ggprism)
+library(sgpv)
+library(robustlmm)
+library(glmmTMB)
+library(RColorBrewer)
+library(see)
+library(MASS)
+library(nlme)
+library(ggradar)
+library(dplyr)
+library(scales)
+library(fmsb)
+
+# Manuscript: Within 4, Mean distance, first distance (nearest neighbor), avg distance of 3 nearest. Functions allow for other options
+
+convert = read_excel("screen_gene_names.xlsx")
+file_path = "~/"
+custom_colors=c("")
+```
+
+
+
+# R Files {.tabset}
+
+```{r}
+
+#two analysis functions, 1 for bodylength, the other for distances
+#and two plotting functions
+
+# Analysis works by fitting a model to all genotypes, saving those results, and the testing 
+# to see if the genotype differs from all other mutant genotypes and WT
+# If this is the MiMIC or Trojan dom validation sets, we only check against WT.
+# Differences that are only different from WT have a black asterisk, if they differ from WT and the other mutants it is red. All significance is based on +/- 10% null interval
+
+fit_within = function(data.a,BL=4){
+  ix = which(colnames(data.a) == paste0("Within",BL)) # find the column that matches the BL
+  colnames(data.a)[ix] = "Withinx" # rename it to Wihtinx for easier processing
+  data.a$Replicate = paste0(data.a$Replicate,data.a$file,data.a$Genotype)
+  data.a$Genotype = as.character(data.a$Genotype) # Make sure this isn't a factor
+  data.a$Genotype = factor(data.a$Genotype,levels=c("WT",unique(data.a$Genotype[data.a$Genotype !="WT"]))) # Now we factor so WT is the reference
+  
+  data.a$Withinx = as.numeric(data.a$Withinx) # Make sure this is numeric
+  
+  fit = glmmTMB(Withinx ~ Genotype + (1|file/Replicate), data = data.a,family = "nbinom2") # We're counting the number of flies within x bodylengths, so we'll opt for a negative binomial fit. Each file gets a random effect, replicate is nested within file.
+  return(fit)
+}
+
+#Pass the model fit from fit_within(), the number of BLs, and the gn to be processed
+plot_within = function(fit,BL,gn,data.a){
+  ix = which(colnames(data.a) == paste0("Within",BL))
+  colnames(data.a)[ix] = "Withinx"
+
+  data.a$Replicate = paste0(data.a$Replicate,data.a$file,data.a$Genotype)
+  data.a$Genotype = as.character(data.a$Genotype)
+  data.a$Genotype = factor(data.a$Genotype,levels=c("WT",unique(data.a$Genotype[data.a$Genotype !="WT"])))
+  
+  data.a$Withinx = as.numeric(data.a$Withinx)
+
+  data.tmp = data.frame(difference =  summary(fit)$coeff$cond[-1,][,1])
+
+  i.diff = data.frame(diff = summary(fit)$coeff$cond[-1,][,1][names(-summary(fit)$coeff$cond[-1,][,1]) == paste0("Genotype",gn)])
+
+  p.dist = ggplot(data=data.tmp, aes(x = "", y = difference)) + geom_quasirandom(size=2)+theme_bw(14) + geom_hline(data = i.diff,aes(yintercept = diff ,color = gn),linetype = "dotted",linewidth = 2)+scale_color_manual(values="grey")+
+              theme(legend.title = element_blank())+ylab("log(Mutant/WT)")+xlab("")
+          
+  g.ix = which(rownames(summary(fit)$coeff$cond) == paste0("Genotype",gn))
+  ctrl.ixs = which(rownames(summary(fit)$coeff$cond) != paste0("Genotype",gn))[-1] # drop the intercept, we only want the non i genotype coeffs
+            
+  ctrl.contr = rep(-1/length(ctrl.ixs), length(ctrl.ixs))
+  contrast = rep(1,length(summary(fit)$coeff$fixed))
+  contrast[1] = 0 #We don't care about the WT mean aka the intercept
+  contrast[ctrl.ixs] = ctrl.contr
+  contrast[g.ix] = 1
+  mean.c = abs(contrast) 
+  mean.c[g.ix] = 0
+  int = c(1,rep(0,length(mean.c)-1))
+  v.WT = int
+  v.WT[g.ix] = 1
+  v.WT[1] = -1
+  L <- list(contrast,v.WT, mean.c,int)
+
+  res = confint(emmeans(fit, "Genotype") |>
+    contrast(lapply(1:2,function(x) L[[x]])))
+  
+  
+  mus = confint(emmeans(fit, "Genotype") |>
+    contrast(lapply(3:4,function(x) L[[x]])))
+  res$contrast = c(paste0(gn," vs all others"),paste0(gn, " vs WT"))
+
+  res$SGPV.WT = sgpv::sgpvalue(est.lo = res$asymp.LCL[2],
+                            est.hi = res$asymp.UCL[2],
+                            null.hi = log(1.1),
+                            null.lo = -log(1.1))$p.delta
+  
+  res$ranking.WT = sgpv::sgpvalue(est.lo = res$asymp.LCL[2],
+                            est.hi = res$asymp.UCL[2],
+                            null.hi = log(1.1),
+                            null.lo = -log(1.1))$delta.gap
+  
+  res$SGPV.MiMICs = sgpv::sgpvalue(est.lo = res$asymp.LCL[1],
+                            est.hi = res$asymp.UCL[1],
+                            null.hi = log(1.1),
+                            null.lo = -log(1.1))$p.delta
+  
+  res$ranking.MiMICs = sgpv::sgpvalue(est.lo = res$asymp.LCL[1],
+                            est.hi = res$asymp.UCL[1],
+                            null.hi = log(1.1),
+                            null.lo = -log(1.1))$delta.gap
+
+  res = res[2,] # we just need one row and we'd prefer to keep the one vs WT
+  res$Diet = "CSD" # change if ther are more diets
+  data.gn = data.a[data.a$Genotype %in% c("WT",gn) & data.a$file %in% unique(data.a$file[data.a$Genotype==gn]),]
+  agg.d = aggregate(Withinx ~ Genotype + Replicate, data.gn, mean)
+  
+  p3 = ggplot(agg.d,aes(x = Genotype, y = Withinx,color=Genotype)) +
+    geom_beeswarm(size=2) + theme_classic() +
+    ylab(paste0("Mean number of flies per replciate within ", BL," bodylengths\n Mean of Means +/- SD")) +
+    stat_summary(fun.data = "mean_sdl", fun.args = list(mult = 1), geom = "errorbar", width = 0.2)+
+    stat_summary(fun = "mean",geom="point",size=4,shape=1)+
+    scale_color_manual(values=custom_colors)+coord_flip()+
+    xlab("") +theme(legend.position = "none") 
+    
+  if(res$SGPV.WT == 0){
+      color = ifelse(res$SGPV.MiMICs==0,"red","grey")
+      
+      p3 = p3 + annotate(geom="text",label = "*",x = 1.5,y = max(agg.d$Withinx)*1.35,size=11,vjust=0.8,color=color) + 
+        annotate(geom="line",x = c(1,1.4),y = max(agg.d$Withinx)*1.35,2) +
+        annotate(geom="line",x = c(1.6,2),y = max(agg.d$Withinx)*1.35,2)
+
+    }
+  
+  p1 = ggplot(data.a[data.a$Genotype %in% c("WT",gn) & data.a$file %in% unique(data.a$file[data.a$Genotype==gn]),],aes(x = Genotype, y = Withinx,color=Genotype,fill=Genotype)) +
+    theme_classic() +
+    ylab(paste0("Number of flies within ", BL," bodylengths")) +
+    geom_quasirandom(width=0.15,alpha=0.4) +
+    geom_violinhalf(position = position_nudge(x = 0.2),adjust=0.75,width=1.1) +
+    coord_flip() +xlab("") + scale_color_manual(values=custom_colors)+
+    scale_fill_manual(values=custom_colors)+
+    theme(legend.position = "none")
+  
+    if(res$SGPV.WT == 0){
+      color = ifelse(res$SGPV.MiMICs==0,"red","grey")
+      
+      p1 = p1 + annotate(geom="text",label = "*",x = 1.5,y = max(data.gn$Withinx,na.rm=T)*1.35,size=11,vjust=0.8,color=color) + 
+        annotate(geom="line",x = c(1,1.4),y =max(data.gn$Withinx,na.rm=T)*1.35,2) +
+        annotate(geom="line",x = c(1.6,2),y = max(data.gn$Withinx,na.rm=T)*1.35,2)
+
+    }
+  
+  
+  data.gn$Withinx[data.gn$Withinx>=10 ] = "10+"
+  data.gn$Withinx = as.character(data.gn$Withinx)
+  data.gn$Genotype = factor(data.gn$Genotype,levels=c("WT",gn))
+
+  cbar = data.frame(Genotype = levels(data.gn$Genotype),perc=100,Withinx = 0)
+  
+  d2 <- data.gn %>%
+    group_by(Genotype, Withinx) %>%
+    dplyr::summarise(count = n()) %>%
+    mutate(perc = count/sum(count))
+  
+  cbar$Genotype = factor(cbar$Genotype,levels=c("WT",gn))
+
+  p2 = ggplot(d2,aes(x= Genotype, y=100*perc,fill = Withinx)) + geom_bar(stat="identity",width=0.65) + theme_classic()  + 
+    scale_fill_manual(values=colorRampPalette(c("grey100","grey0"))(11)) +
+    theme(legend.title = element_text(),legend.position = "right")+
+    xlab("")+ylab("Percentage")+
+    scale_y_continuous()+xlab("") +
+    guides(alpha=guide_legend(title=paste0("Flies within\n", BL," body lengths")),fill = guide_legend(title=paste0("Flies within\n", BL," body lengths")),color="none")+
+    coord_cartesian(clip="off") +
+    geom_bar(data=cbar,aes(x=Genotype,color=Genotype,y=perc),fill=NA,stat="identity",size=1,width=0.65)+scale_color_manual(values=custom_colors)+
+    coord_flip()
+    
+    if(res$SGPV.WT == 0){
+      color = ifelse(res$SGPV.MiMICs==0,"red","grey")
+      
+      p2 = p2 + annotate(geom="text",label = "*",x = 1.5,y = 110,size=11,vjust=0.8,color=color) + 
+        annotate(geom="line",x = c(1,1.4),y = 110,2) +
+        annotate(geom="line",x = c(1.6,2),y = 110,2)
+
+    }
+  
+  if(res$SGPV.MiMICs == 0){
+    p.dist = p.dist+scale_color_manual(values="red")
+  }
+  p.w.in = p.dist+ p1 + p2 + p3 + plot_layout(ncol=4)
+  
+
+  suppressWarnings(suppressMessages(print(p.w.in)))
+  
+  return(list(p.w.in,data.frame(assay = paste0("Within ",BL," Body length"),genotype = gn, res )))
+  
+}
+
+fit_dist = function(data.a,dist){
+  
+  data.a$ID = paste0(data.a$file,data.a$Replicate,data.a$Genotype)
+  data.a$Group = factor(data.a$Group,levels=c("MGD"),labels=c("CSD"))
+  data.a$Replicate = paste0(data.a$Replicate,data.a$file,data.a$Genotype)
+  data.a$Genotype = as.character(data.a$Genotype)
+  data.a$Genotype = factor(data.a$Genotype,levels=c("WT",unique(data.a$Genotype[data.a$Genotype !="WT"])))
+  
+  colnames(data.a)[colnames(data.a) == dist] = "y"
+  data.a$Replicate = factor(data.a$Replicate)
+  data.a$file = factor(data.a$file)
+  
+  fit <- nlme::lme(log2(y)~Genotype,data=data.a,random= ~1|file/Replicate,control = lmeControl(opt = "optim"),weights = varIdent(form = ~1|Genotype),method="ML") #log2 transform these outcomes, a generally good transformation for distances. It won't be perfect for all of them, but generally robust. random effects for file and replicate nested within file. We also allow for unequal genotype variances. This costs us some prediction and power, but generally yields more robust results
+  
+  return(fit)
+  
+}
+
+plot_dist = function(fit,dist,gn,data.a){
+  
+  data.a$ID = paste0(data.a$file,data.a$Replicate,data.a$Genotype)
+  data.a$Group = factor(data.a$Group,levels=c("MGD"),labels=c("CSD"))
+  data.a$Genotype = as.character(data.a$Genotype)
+  data.a$Genotype = factor(data.a$Genotype,levels=c("WT",unique(data.a$Genotype[data.a$Genotype !="WT"])))
+  
+  data.a$Replicate = paste0(data.a$Replicate,data.a$file,data.a$Genotype)
+  data.a$Genotype = as.character(data.a$Genotype)
+  data.a$Genotype = factor(data.a$Genotype,levels=c("WT",unique(data.a$Genotype[data.a$Genotype !="WT"])))
+  colnames(data.a)[colnames(data.a) == dist] = "y"
+  data.a$y = as.numeric(data.a$y)
+  
+  data.tmp = data.frame(difference =  summary(fit)$coeff$fixed[-1])
+
+  i.diff = data.frame(diff = summary(fit)$coeff$fixed[-1][names(-summary(fit)$coeff$fixed[-1]) == paste0("Genotype",gn)])
+
+  p.dist = ggplot(data=data.tmp, aes(x = "", y = difference)) + geom_quasirandom(size=2)+theme_bw(14) + geom_hline(data = i.diff,aes(yintercept = diff ,color = gn),linetype = "dotted",linewidth = 2)+scale_color_manual(values="grey")+
+              theme(legend.title = element_blank())+ylab("log2(Mutant/WT)")+xlab("")
+          
+  g.ix = which(names(summary(fit)$coeff$fixed) == paste0("Genotype",gn))
+  ctrl.ixs = which(names(summary(fit)$coeff$fixed) != paste0("Genotype",gn))[-1] # drop the intercept, we only want the non i genotype coeffs
+            
+  ctrl.contr = rep(-1/length(ctrl.ixs), length(ctrl.ixs))
+  contrast = rep(1,length(summary(fit)$coeff$fixed))
+  contrast[1] = 0 #We don't care about the WT mean aka the intercept
+  contrast[ctrl.ixs] = ctrl.contr
+  contrast[g.ix] = 1
+  mean.c = abs(contrast) 
+  mean.c[g.ix] = 0
+  int = c(1,rep(0,length(mean.c)-1))
+  v.WT = int
+  v.WT[g.ix] = 1
+  v.WT[1] = -1
+  L <- list(contrast,v.WT, mean.c,int)
+
+  res = confint(emmeans(fit, "Genotype") |>
+    contrast(lapply(1:2,function(x) L[[x]])))
+
+  mus = confint(emmeans(fit, "Genotype") |>
+    contrast(lapply(3:4,function(x) L[[x]])))
+  res$contrast = c(paste0(gn," vs all others"),paste0(gn, " vs WT"))
+
+  res$SGPV.WT = sgpv::sgpvalue(est.lo = res$lower.CL[2],
+                            est.hi = res$upper.CL[2],
+                            null.hi = log2(1.1),
+                            null.lo = -log2(1.1))$p.delta
+  
+  res$ranking.WT = sgpv::sgpvalue(est.lo = res$lower.CL[2],
+                            est.hi = res$upper.CL[2],
+                            null.hi = log2(1.1),
+                            null.lo = -log2(1.1))$delta.gap
+  
+  res$SGPV.MiMICs = sgpv::sgpvalue(est.lo = res$lower.CL[1],
+                            est.hi = res$upper.CL[1],
+                            null.hi = log2(1.1),
+                            null.lo = -log2(1.1))$p.delta
+  
+  res$ranking.MiMICs = sgpv::sgpvalue(est.lo = res$lower.CL[1],
+                            est.hi = res$upper.CL[1],
+                            null.hi = log2(1.1),
+                            null.lo = -log2(1.1))$delta.gap
+
+  res = res[2,] # we just need one row and we'd prefer to keep the one vs WT
+  res$Diet = "CSD" # change if ther are more diets
+  data.gn = data.a[data.a$Genotype %in% c("WT",gn) & data.a$file %in% unique(data.a$file[data.a$Genotype==gn]),]
+ 
+  yl = case_when(dist == "med_dist" ~ "Median distance from all other flies",
+                 dist == "av_clust" ~ "Median distance of 3 nearest flies",
+                  dist == "dist1" ~ "Median distance from nearest neighbor",
+                  dist == "dist2" ~ "Distance from second nearest neighbor",
+                  dist == "dist3" ~ "Distance from third nearest neighbor",)
+
+   pal = ifelse(data.a$sex[1] == "male", "GnBu","RdPu")
+   
+   
+   p1 = ggplot(data.gn,aes(x = Genotype,y = y,color=Genotype,shape=Replicate)) +  
+     geom_quasirandom(size=2,alpha=0.45,width=0.35) + theme_classic() + ylab(yl) + geom_boxplot(outlier.size = -1,fill=NA,aes(group = Genotype),linewidth=0.75,fatten=4,show.legend = F,width=0.75)+scale_color_manual(values=custom_colors)+
+     scale_y_continuous() +coord_flip()+xlab("")+
+     guides(color="none")
+   
+    if(res$SGPV.WT == 0){
+      color = ifelse(res$SGPV.MiMICs == 0,"red","grey")
+      
+      p1 = p1 + annotate(geom="text",label = "*",x = 1.5,y = max(data.a$y)*1.05,size=11,vjust=0.8,color=color) + 
+        annotate(geom="line",x = c(1,1.4),y = rep(max(data.a$y)*1.05,2)) +
+        annotate(geom="line",x = c(1.6,2),y = rep(max(data.a$y)*1.05,2))
+    }
+  
+  
+    agg.d = aggregate(y ~ Genotype + Replicate, data.gn, function(x) 2^mean(log2(x),na.rm=T))
+
+    p2 = ggplot(agg.d,aes(x = Genotype, y = y,color=Genotype)) +
+    geom_point(size=3) + theme_classic() +
+    ylab(yl) +
+    stat_summary(fun.data = "mean_sdl", fun.args = list(mult = 1), geom = "errorbar", width = 0.2)+
+    stat_summary(fun = "mean",geom="point",size=4,shape=1)+
+    ylab(paste0("Mean ",tolower(yl), "\nMean of meidans+/- SD")) +
+    scale_color_manual(values=custom_colors)+coord_flip()+ scale_y_continuous()+
+    xlab("") +theme(legend.position = "none")
+    
+    
+    if(res$SGPV.WT==0){
+      color = ifelse(res$SGPV.MiMICs == 0,"red","grey")
+      p2 = p2 + annotate(geom="text",label = "*",x = 1.5,y = max(agg.d$y)*1.35,size=11,vjust=0.8,color=color) + 
+        annotate(geom="line",x = c(1,1.4),y = rep(max(agg.d$y)*1.35,2)) +
+        annotate(geom="line",x = c(1.6,2),y = rep(max(agg.d$y)*1.35,2))
+    }
+  
+    p1 = p1+theme(legend.position = "none")
+    
+    if(res$SGPV.MiMICs == 0){
+        p.dist = p.dist+scale_color_manual(values="red")
+    }
+    
+    suppressWarnings(suppressMessages(print(p.dist+p1+p2)))
+    
+     
+    
+   return(list(p.dist+p1+p2,data.frame(assay = rep(yl),genotype=gn,res)))
+   
+}
+
+substrRight <- function(x, n){
+  substr(x, nchar(x)-n+1, nchar(x))
+}
+
+
+```
+
+
+```{r}
+
+
+files = list.files(file_path)
+
+df=NULL
+for(i in files){
+  tmp = read_excel(paste0(file_path,i))
+  tmp$file = i
+  df = rbind(df,tmp)
+}
+
+df$file = as.factor(df$file)
+df = df[grepl("MGD",df$condition,fixed=T),]
+df$Genotype =  unlist(lapply(strsplit(df$condition," "), function(x) x[[2]]))
+df$sex =  unlist(lapply(strsplit(df$condition," "), function(x) x[[3]]))
+df$Replicate = unlist(lapply(strsplit(df$condition," "), function(x) x[[4]]))
+df$ID = as.factor(paste0(df$file,df$condition))
+df$Genotype.b = ifelse(df$Genotype == "WT",0,1)
+df$Replicate = as.factor(df$Replicate)
+df$condition = as.factor(gsub(" ","",df$condition))
+
+## Number of flies per body length
+m.bl = sqrt(median(df$areas[df$sex == "male" & df$areas<200])/base::pi)*2
+f.bl = sqrt(median(df$areas[df$sex == "female"& df$areas<200])/base::pi)*2
+
+within.fx = function(id){
+  tmp = df[df$ID ==id,]
+  
+  tmp.d=as.matrix(dist(subset(tmp,select=c(x_coor,y_coor)),upper=T))
+  bl = ifelse(tmp$sex[1] == "female",f.bl,m.bl)
+  tmp$Within1 =  apply(tmp.d,2, function(x){ sum(I(x < bl & x > 0 )) } )
+  tmp$Within2 =  apply(tmp.d,2, function(x){ sum(I(x < 2*bl & x > 0 )) } )
+  tmp$Within3 =  apply(tmp.d,2, function(x){ sum(I(x < 3*bl & x > 0 )) } )
+  tmp$Within4 =  apply(tmp.d,2, function(x){ sum(I(x < 4*bl & x > 0 )) } )
+  tmp$med_dist = apply(tmp.d,2, function(x){ median(x[x>0])} )
+
+  return(tmp)
+   
+}
+
+df = rbindlist(lapply(unique(df$ID), function(x) within.fx(x)))
+names = convert$`Drosophila Ortholog`[ match(unique(df$Genotype[df$Genotype != "WT"]),convert$`Bloomington Number` )]
+names[is.na(names)] = unique(df$Genotype[df$Genotype != "WT"])[is.na(names)]
+names = gsub("-",".",names)
+df$Genotype = factor(df$Genotype,levels=c("WT",unique(df$Genotype[df$Genotype != "WT"])),labels = c("WT", names))
+df$av_clust = robustbase::rowMedians(data.matrix(subset(df,select=c(dist1,dist2,dist3))),na.rm=T)
+
+```
+
+## Males {.tabset}
+
+### WTs
+
+This is really interesting to see, we can appreciate the central limit theorem kicking in. This also suggests that variance in the WTs is more-or-less random.  There are a few large-ish outliers in the 4 bodylengths plot, the mixed-effects model will account for this as best as possible. 
+
+```{r}
+custom_colors = brewer.pal(n = 5,name="GnBu")[2:5]
+
+male.wt = reshape2::melt(subset(df[df$sex == "male",],select=c(file,Within4,dist1,med_dist,av_clust )),id.vars = "file")
+
+male.wt.agg = aggregate(value~variable + file, male.wt, function(x) 2^mean(log2(x+1/19),na.rm=T))
+male.wt.agg$variable = factor(male.wt.agg$variable,levels=c("Within4","dist1","med_dist","av_clust"),labels=c("Number of flies within 4 bodylengths", "Nearest fly",
+                                                                                                              "Median distance from all other flies", "Median distance of 3 nearest flies"))
+ggplot(male.wt.agg,aes(x = "", y = value)) +
+  facet_wrap(~variable,scales="free",strip.position = "left",ncol=4) + 
+  theme_prism() + geom_quasirandom() +xlab("Each file's WT") +
+  theme(strip.background = element_blank(),
+        strip.placement = "outside") + ylab("")
+
+
+
+```
+
+### Plots of data
+
+```{r}
+ 
+
+  df$sex = tolower(df$sex)
+  gns = unique(df$Genotype[df$Genotype != "WT"])
+  gns
+  
+  
+res.tmp = NULL
+#sba is diverging, so we're going to remove it from the comparisons to avoid averaging with infinity
+bl.4 = fit_within(df[df$sex == "male" & df$Genotype != "sba",],BL = 4) 
+dist1 = fit_dist(df[df$sex == "male",],"dist1") 
+med_dist = fit_dist(df[df$sex == "male",],"med_dist")
+av_clust = fit_dist(df[df$sex == "male",],"av_clust") 
+res.tmp = NULL
+
+for(i in gns){
+  print(i)
+  res.4 = suppressMessages(suppressWarnings( plot_within(fit=bl.4,BL=4,gn = i,data.a = df[df$sex == "male",])[[2]]))
+  colnames(res.4)[7:8] = c("lower.CL","upper.CL")
+  res.d1 = suppressMessages(suppressWarnings( plot_dist(fit=dist1,dist="dist1",gn = i,data.a = df[df$sex == "male",])[[2]]))
+  res.med = suppressMessages(suppressWarnings( plot_dist(fit=med_dist,dist="med_dist",gn = i,data.a = df[df$sex == "male",])[[2]]))
+  res.clust = suppressMessages(suppressWarnings( plot_dist(fit=av_clust,dist="av_clust",gn = i,data.a = df[df$sex == "male",])[[2]]))
+  res.tmp= rbind(res.tmp,rbind(res.4,res.d1,res.med,res.clust)  )
+}  
+
+res.tmp$Sex = "Male"
+res.tmp$Result = case_when(res.tmp$SGPV.WT == 0 & res.tmp$SGPV.MiMICs == 0 ~"Hit",
+                          res.tmp$SGPV.WT == 0 ~ "Differs from WT Only",
+                          res.tmp$SGPV.WT == 1 ~"Equivalent",
+                          TRUE~"Inconclusive") 
+
+write.csv(res.tmp,"males_SD.csv",row.names = F)
+
+```
+
+### Results {.tabset}
+
+
+
+#### Radar/Spider Plots
+
+```{r}
+
+radar_plot = function(gn){
+  bl.4.gn = aggregate(Within4 ~ Genotype,df[df$sex=="male" & df$file == unique(df$file[df$Genotype == gn]) & df$Genotype %in% c("WT",gn),],mean)
+  colnames(bl.4.gn)[2] = "estimate"
+  bl.4.gn$var = "Within4"
+  
+  dist1.gn = aggregate(dist1 ~ Genotype,df[df$sex=="male" & df$file == unique(df$file[df$Genotype == gn]) & df$Genotype %in% c("WT",gn),],mean)
+  colnames(dist1.gn)[2] = "estimate"
+  dist1.gn$var = "dist1"
+  
+  med_dist.gn = aggregate(med_dist ~ Genotype,df[df$sex=="male" & df$file == unique(df$file[df$Genotype == gn]) & df$Genotype %in% c("WT",gn),],mean)
+  colnames(med_dist.gn)[2] = "estimate"
+  med_dist.gn$var = "med_dist"
+  
+  av_clust.gn = aggregate(av_clust ~ Genotype,df[df$sex=="male" & df$file == unique(df$file[df$Genotype == gn]) & df$Genotype %in% c("WT",gn),],mean)
+  colnames(av_clust.gn)[2] = "estimate"
+  av_clust.gn$var = "av_clust"
+  
+  plot.d.mut = rbind(bl.4.gn,dist1.gn,med_dist.gn,av_clust.gn)
+  
+  withincdf = ecdf(aggregate(Within4 ~ condition,df[df$sex=="male" & grepl("MGD",fixed=T,df$condition),],mean)$Within4)
+  dist1cdf = ecdf(aggregate(dist1 ~ condition,df[df$sex=="male"& grepl("MGD",fixed=T,df$condition),],mean)$dist1)
+  meddistcdf = ecdf(aggregate(med_dist ~ condition,df[df$sex=="male"& grepl("MGD",fixed=T,df$condition),],mean)$med_dist)
+  avclustcdf = ecdf(aggregate(av_clust ~ condition,df[df$sex=="male"& grepl("MGD",fixed=T,df$condition),],mean)$av_clust)
+  
+  plot.d.mut$Percent = rep(0)
+  plot.d.mut$Percent [plot.d.mut$var == "Within4"] <- sapply(plot.d.mut$estimate[plot.d.mut$var == "Within4"], function (x) withincdf(x))
+  plot.d.mut$Percent [plot.d.mut$var == "med_dist"] <- sapply(plot.d.mut$estimate[plot.d.mut$var == "med_dist"], function (x) meddistcdf(x))
+  plot.d.mut$Percent [plot.d.mut$var == "dist1"] <- sapply(plot.d.mut$estimate[plot.d.mut$var == "dist1"], function (x) dist1cdf(x))
+  plot.d.mut$Percent [plot.d.mut$var == "av_clust"] <- sapply(plot.d.mut$estimate[plot.d.mut$var == "av_clust"], function (x) avclustcdf(x))
+  
+  
+  
+  plot.d.mut$var_lab = case_when(plot.d.mut$var == "Within4" ~ "Within 4 BL",
+                         plot.d.mut$var == "med_dist" ~ "Median Distance",
+                         plot.d.mut$var == "av_clust" ~ "Nearest 3 flies",
+                         plot.d.mut$var == "dist1" ~ "Nearest fly")
+  
+  df.radar = reshape(subset(plot.d.mut,select= c(var_lab,Genotype,Percent))
+  , idvar = "Genotype", timevar = "var_lab", direction = "wide")
+  colnames(df.radar) = gsub("Percent.","",colnames(df.radar))
+  
+  #cols = c("#737373", "#e7cdb4")
+  cols = brewer.pal(n=3,name="GnBu")[c(1,3)]
+  p = ggradar(df.radar,fill = TRUE, fill.alpha = 0.5,group.point.size = 0,values.radar = c("", "",""),group.colours = cols  ,background.circle.colour = "white",group.line.width = 2, axis.label.size = 3)+ theme(legend.position = "none",legend.text.size = 10, plot.margin = margin(1, 2.5,1, 2.5, 'cm')) + coord_cartesian(clip = "off") + ggtitle(gn)
+  return(p)
+}
+
+
+
+#Based on num significant outcomes
+top3genes = c("Lpt","Sin3A","cic")
+
+radar_males = wrap_plots(lapply(top3genes,function(x) radar_plot(x))) + plot_layout(ncol=3)
+
+
+ggsave(
+  filename = "radar_plot_males.pdf",
+  plot = radar_males,
+  width = 35,                     # adjust as needed
+  height = 10,
+  units = "in",
+  device = "pdf"
+)
+
+```
+
+#### CSD mutant vs CSD WT
+
+
+```{r, fig.height = nrow(res.tmp)/20,fig.width = 18 }
+
+res.tmp$contrast = gsub(" vs.*","",res.tmp$contrast)
+p1 = ggplot(res.tmp,aes(x=assay,y=contrast,fill=estimate))+
+    geom_tile(color="black") + theme_classic(11) + xlab("") + ylab("") +
+    scale_fill_gradient2( low="blue",mid="white",high="red",midpoint=0)+
+    theme(strip.background = element_blank(),
+          axis.line.x = element_blank(),
+          axis.line.y = element_blank(),
+          legend.position="top",
+          legend.key.width=unit(4,"cm"),
+          axis.text.x = element_text(angle=45,hjust=1)) +
+    theme(legend.key.width = unit(1, 'cm'))+ guides(fill=guide_colorbar(title="log2(FC)"))
+
+ 
+
+p2 = ggplot(res.tmp,aes(x=assay,y=contrast,fill=SGPV.WT))+
+    geom_tile(color="black") + theme_classic(11) + xlab("") + ylab("") +
+    scale_fill_gradient2(low="darkred",mid="white",high="black",midpoint=0.5,limits=c(-0.01,1.01),n.breaks = 7 )+  
+    theme(strip.background = element_blank(),
+          axis.line.x = element_blank(),
+          axis.line.y = element_blank(),
+          legend.position="top",
+          legend.key.width=unit(4,"cm"),
+          axis.text.x = element_text(angle=45,hjust=1)) +
+      theme(legend.key.width = unit(1, 'cm'))+ guides(fill=guide_colorbar(title="SGPV vs WT"))
+
+
+
+p3 = ggplot(res.tmp,aes(x=assay,y=contrast,fill=Result))+
+    geom_tile(color="black") + theme_classic(11) + xlab("") + ylab("") +
+    scale_fill_manual(values = c("Equivalent" = "black","Inconclusive" = "white", "Hit" = "red", "Differs from WT Only" = "grey"))+  
+    theme(strip.background = element_blank(),
+          axis.line.x = element_blank(),
+          axis.line.y = element_blank(),
+          legend.position="top",
+          axis.text.x = element_text(angle=45,hjust=1),
+          ) +    theme(legend.key.width = unit(1, 'cm'))
+
+heatmap_males = p1 + p2 + p3 +plot_layout(axes = "collect_y") 
+
+ggsave(
+  filename = "heatmap_males.pdf",
+  plot = heatmap_males,
+  width = 15,                     # adjust as needed
+  height = 12,
+  units = "in",
+  device = "pdf"
+)
+
+```
+
+#### Table
+
+```{r}
+
+DT::datatable(res.tmp)
+
+```
+
+
+#### Forest 
+
+```{r, fig.height = 35,fig.width=18}
+
+df <- read.csv("males_SD.csv", stringsAsFactors = FALSE)
+
+# ---- Clean / standardize Result labels ----
+df$Result <- trimws(df$Result)
+
+df$Result <- ifelse(tolower(df$Result) == "hit", "Hit", df$Result)
+
+df$Result <- ifelse(
+  grepl("^differs\\s*from\\s*wt\\s*only$", tolower(df$Result)),
+  "Differs from WT only",
+  df$Result
+)
+
+df$Result <- ifelse(tolower(df$Result) == "inconclusive", "Inconclusive", df$Result)
+
+# ---- Plot status (3-level color scheme) ----
+df$Plot_status <- df$Result
+df$Plot_status[!(df$Plot_status %in% c("Hit", "Differs from WT only", "Inconclusive"))] <- "Inconclusive"
+
+df$Plot_status <- factor(
+  df$Plot_status,
+  levels = c("Inconclusive", "Differs from WT only", "Hit")
+)
+
+# ---- Assay factor ----
+df$assay <- trimws(df$assay)
+assay_order <- c(
+  "Within 4 Body Lengths",
+  "3 Nearest Neighbors",
+  "Nearest Neighbor",
+  "Global Average"
+)
+
+df$Assay <- factor(df$assay, levels = assay_order)
+
+#df$Assay <- factor(df$assay, levels = unique(df$assay))
+
+# ---- Build per-assay forest plots ----
+plot.f <- list()
+
+for (a in levels(df$Assay)) {
+
+  plot.t <- df[df$Assay == a, ]
+
+  # order genes within each assay by estimate (low -> high)
+  plot.t$genotype <- factor(
+    plot.t$genotype,
+    levels = plot.t$genotype[order(plot.t$estimate)]
+  )
+
+  plot.f[[a]] <- ggplot(
+    plot.t,
+    aes(x = genotype, y = estimate, color = Plot_status)
+  ) +
+    geom_linerange(
+  aes(ymin = lower.CL, ymax = upper.CL),
+  linewidth = 0.5
+) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.45) +
+    scale_color_manual(
+      values = c(
+        "Inconclusive" = "bisque2",
+        "Differs from WT only" = "grey40",
+        "Hit" = "red"
+      )
+    ) +
+    coord_flip() +
+    theme_prism(base_size = 30) +
+    theme(
+      axis.line.x = element_line(linewidth = 0.4),
+      axis.line.y = element_line(linewidth = 0.4),
+      axis.ticks.x = element_line(linewidth = 0.3),
+      axis.ticks.y = element_line(linewidth = 0.3),
+      axis.text.y  = element_text(size = 20, face = "plain"),
+      axis.text.x  = element_text(face = "plain"),
+      axis.title.x = element_text(face = "plain"),
+      plot.title = element_text(size = 35, face = "plain", hjust = 0.5),
+      legend.position = "none"
+    ) +
+    labs(
+      title = a,          # <-- original behavior: use assay name directly
+      y = "Mean diff",
+      x = ""
+    )
+}
+
+p_forest <- wrap_plots(plot.f, ncol = 4)+
+  plot_annotation(
+    title = "Males
+    ",
+    theme = theme(
+      plot.title = element_text(
+        face = "plain",
+        size = 45,
+        hjust = 0.5   # center the title
+      )
+    )
+  )
+
+p_forest
+
+ggsave(
+  filename = "forest_plot_males_SD_status_colored.pdf",
+  plot = p_forest,
+  width = 30,
+  height = 25,
+  units = "in",
+  device = "pdf"
+)
+
+# ---- Export ranked order by estimate for each assay ----
+orders_df <- do.call(rbind, lapply(split(df, df$assay), function(dfi) {
+
+  dfi <- dfi[order(dfi$estimate, decreasing = TRUE), ]  # high -> low
+
+  data.frame(
+    assay = unique(dfi$assay),
+    genotype = dfi$genotype,
+    estimate = dfi$estimate,
+    lower.CL = dfi$lower.CL,
+    upper.CL = dfi$upper.CL,
+    Result = dfi$Result,
+    display_rank = seq_len(nrow(dfi)),
+    stringsAsFactors = FALSE
+  )
+}))
+
+write.csv(
+  orders_df,
+  "all_assays_gene_order_by_estimate_males_SD.csv",
+  row.names = FALSE
+)
+```
+
+
+## Females {.tabset}
+
+
+### WTs
+
+Distributions are less symmetrical compared to males, there may be another underlying mechanism at play that isn't purely random. Again mixed-effect models will account for this as much as possible. 
+
+```{r}
+
+
+custom_colors = brewer.pal(n = 5,name="RdPu")[2:5]
+
+
+female.wt = reshape2::melt(subset(df[df$sex == "female",],select=c(file,Within4,dist1,med_dist,av_clust )),id.vars = "file")
+
+female.wt.agg = aggregate(value~variable + file, female.wt, function(x) 2^mean(log2(x+1/19),na.rm=T))
+female.wt.agg$variable = factor(female.wt.agg$variable,levels=c("Within4","dist1","med_dist","av_clust"),labels=c("Number of flies within 4 bodylengths", "Nearest fly",
+                                                                                                              "Median distance from all other flies", "Median distance of 3 nearest flies"))
+ggplot(female.wt.agg,aes(x = "", y = value)) +
+  facet_wrap(~variable,scales="free",strip.position = "left",ncol=4) + 
+  theme_prism() + geom_quasirandom() +xlab("Each file's WT") +
+  theme(strip.background = element_blank(),
+        strip.placement = "outside") + ylab("")
+
+
+```
+
+
+### Plots of data
+Coro had to be dropped here because the single rep was causing issues when we switched to means.
+```{r}
+gns = unique(df$Genotype[df$Genotype != "WT"])
+gns
+
+
+res.tmp = NULL
+#sba is diverging, so we're going to remove it from the comparisons to avoid averaging with infinity
+bl.4 = fit_within(df[df$sex == "female" & df$Genotype != "sba",],BL = 4) 
+dist1 = fit_dist(df[df$sex == "female",],"dist1") 
+med_dist = fit_dist(df[df$sex == "female",],"med_dist")
+av_clust = fit_dist(df[df$sex == "female",],"av_clust") 
+res.tmp = NULL
+
+for(i in gns){
+  print(i)
+  res.4 = suppressMessages(suppressWarnings( plot_within(fit=bl.4,BL=4,gn = i,data.a = df[df$sex == "female",])[[2]]))
+  colnames(res.4)[7:8] = c("lower.CL","upper.CL")
+  res.d1 = suppressMessages(suppressWarnings( plot_dist(fit=dist1,dist="dist1",gn = i,data.a = df[df$sex == "female",])[[2]]))
+  res.med = suppressMessages(suppressWarnings( plot_dist(fit=med_dist,dist="med_dist",gn = i,data.a = df[df$sex == "female",])[[2]]))
+  res.clust = suppressMessages(suppressWarnings( plot_dist(fit=av_clust,dist="av_clust",gn = i,data.a = df[df$sex == "female",])[[2]]))
+  res.tmp= rbind(res.tmp,rbind(res.4,res.d1,res.med,res.clust)  )
+}  
+
+res.tmp$Sex = "Female"
+
+res.tmp$Result = case_when(res.tmp$SGPV.WT == 0 & res.tmp$SGPV.MiMICs == 0 ~"Hit",
+                           res.tmp$SGPV.WT == 0 ~ "Differs from WT Only",
+                           res.tmp$SGPV.WT == 1 ~"Equivalent",
+                           TRUE~"Inconclusive") 
+
+write.csv(res.tmp,"females_SD.csv",row.names = F)
+
+
+```
+
+### Results {.tabset}
+
+#### Radar/Spider Plots
+
+```{r}
+
+radar_plot = function(gn){
+  bl.4.gn = aggregate(Within4 ~ Genotype,df[df$sex=="female" & df$file == unique(df$file[df$Genotype == gn]) & df$Genotype %in% c("WT",gn),],mean)
+  colnames(bl.4.gn)[2] = "estimate"
+  bl.4.gn$var = "Within4"
+  
+  dist1.gn = aggregate(dist1 ~ Genotype,df[df$sex=="female" & df$file == unique(df$file[df$Genotype == gn]) & df$Genotype %in% c("WT",gn),],mean)
+  colnames(dist1.gn)[2] = "estimate"
+  dist1.gn$var = "dist1"
+  
+  med_dist.gn = aggregate(med_dist ~ Genotype,df[df$sex=="female" & df$file == unique(df$file[df$Genotype == gn]) & df$Genotype %in% c("WT",gn),],mean)
+  colnames(med_dist.gn)[2] = "estimate"
+  med_dist.gn$var = "med_dist"
+  
+  av_clust.gn = aggregate(av_clust ~ Genotype,df[df$sex=="female" & df$file == unique(df$file[df$Genotype == gn]) & df$Genotype %in% c("WT",gn),],mean)
+  colnames(av_clust.gn)[2] = "estimate"
+  av_clust.gn$var = "av_clust"
+  
+  plot.d.mut = rbind(bl.4.gn,dist1.gn,med_dist.gn,av_clust.gn)
+  
+  withincdf = ecdf(aggregate(Within4 ~ condition,df[df$sex=="female" & grepl("MGD",fixed=T,df$condition),],mean)$Within4)
+  dist1cdf = ecdf(aggregate(dist1 ~ condition,df[df$sex=="female"& grepl("MGD",fixed=T,df$condition),],mean)$dist1)
+  meddistcdf = ecdf(aggregate(med_dist ~ condition,df[df$sex=="female"& grepl("MGD",fixed=T,df$condition),],mean)$med_dist)
+  avclustcdf = ecdf(aggregate(av_clust ~ condition,df[df$sex=="female"& grepl("MGD",fixed=T,df$condition),],mean)$av_clust)
+  
+  plot.d.mut$Percent = rep(0)
+  plot.d.mut$Percent [plot.d.mut$var == "Within4"] <- sapply(plot.d.mut$estimate[plot.d.mut$var == "Within4"], function (x) withincdf(x))
+  plot.d.mut$Percent [plot.d.mut$var == "med_dist"] <- sapply(plot.d.mut$estimate[plot.d.mut$var == "med_dist"], function (x) meddistcdf(x))
+  plot.d.mut$Percent [plot.d.mut$var == "dist1"] <- sapply(plot.d.mut$estimate[plot.d.mut$var == "dist1"], function (x) dist1cdf(x))
+  plot.d.mut$Percent [plot.d.mut$var == "av_clust"] <- sapply(plot.d.mut$estimate[plot.d.mut$var == "av_clust"], function (x) avclustcdf(x))
+  
+  
+  
+  plot.d.mut$var_lab = case_when(plot.d.mut$var == "Within4" ~ "Within 4 BL",
+                                 plot.d.mut$var == "med_dist" ~ "Median Distance",
+                                 plot.d.mut$var == "av_clust" ~ "Nearest 3 flies",
+                                 plot.d.mut$var == "dist1" ~ "Nearest fly")
+  
+  df.radar = reshape(subset(plot.d.mut,select= c(var_lab,Genotype,Percent))
+                     , idvar = "Genotype", timevar = "var_lab", direction = "wide")
+  colnames(df.radar) = gsub("Percent.","",colnames(df.radar))
+  
+  #cols = c("#737373", "#e7cdb4")
+  cols = brewer.pal(n=3,name="RdPu")[c(1,3)]
+  p = ggradar(df.radar,fill = TRUE, fill.alpha = 0.5,group.point.size = 0,values.radar = c("", "",""),group.colours = cols  ,background.circle.colour = "white",group.line.width = 2, axis.label.size = 3)+ theme(legend.position = "none",legend.text.size = 10, plot.margin = margin(1, 2.5,1, 2.5, 'cm')) + coord_cartesian(clip = "off") #+ ggtitle(gn)
+  return(p)
+}
+
+
+
+#Based on num significant outcomes
+top3genes = c("Sin3A","Nhe2","Hr3")
+
+radar_females = wrap_plots(lapply(top3genes,function(x) radar_plot(x))) + plot_layout(ncol=3)
+
+
+ggsave(
+  filename = "radar_plot_females.pdf",
+  plot = radar_females,
+  width = 35,                     # adjust as needed
+  height = 10,
+  units = "in",
+  device = "pdf"
+)
+
+```
+
+#### CSD mutant vs CSD WT
+
+
+```{r, fig.height = nrow(res.tmp)/20,fig.width = 18 }
+
+res.tmp$contrast = gsub(" vs.*","",res.tmp$contrast)
+p1 = ggplot(res.tmp,aes(x=assay,y=contrast,fill=estimate))+
+  geom_tile(color="black") + theme_classic(11) + xlab("") + ylab("") +
+  scale_fill_gradient2( low="blue",mid="white",high="red",midpoint=0)+
+  theme(strip.background = element_blank(),
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        legend.position="top",
+        legend.key.width=unit(4,"cm"),
+        axis.text.x = element_text(angle=45,hjust=1)) +
+  theme(legend.key.width = unit(1, 'cm'))+ guides(fill=guide_colorbar(title="log2(FC)"))
+
+
+
+p2 = ggplot(res.tmp,aes(x=assay,y=contrast,fill=SGPV.WT))+
+  geom_tile(color="black") + theme_classic(11) + xlab("") + ylab("") +
+  scale_fill_gradient2(low="darkred",mid="white",high="black",midpoint=0.5,limits=c(-0.01,1.01),n.breaks = 7 )+  
+  theme(strip.background = element_blank(),
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        legend.position="top",
+        legend.key.width=unit(4,"cm"),
+        axis.text.x = element_text(angle=45,hjust=1)) +
+  theme(legend.key.width = unit(1, 'cm'))+ guides(fill=guide_colorbar(title="SGPV vs WT"))
+
+
+
+p3 = ggplot(res.tmp,aes(x=assay,y=contrast,fill=Result))+
+  geom_tile(color="black") + theme_classic(11) + xlab("") + ylab("") +
+  scale_fill_manual(values = c("Equivalent" = "black","Inconclusive" = "white", "Hit" = "red", "Differs from WT Only" = "grey"))+  
+  theme(strip.background = element_blank(),
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        legend.position="top",
+        axis.text.x = element_text(angle=45,hjust=1),
+  ) +    theme(legend.key.width = unit(1, 'cm'))
+
+heatmap_females = p1 + p2 + p3 +plot_layout(axes = "collect_y") 
+
+ggsave(
+  filename = "heatmap_females.pdf",
+  plot = heatmap_females,
+  width = 15,                     # adjust as needed
+  height = 12,
+  units = "in",
+  device = "pdf"
+)
+
+```
+
+#### Table
+
+```{r}
+
+DT::datatable(res.tmp)
+
+```
+
+
+
+#### Forest 
+
+```{r, fig.height = 35,fig.width=18}
+
+df <- read.csv("females_SD.csv", stringsAsFactors = FALSE)
+
+# ---- Clean / standardize Result labels ----
+df$Result <- trimws(df$Result)
+
+df$Result <- ifelse(tolower(df$Result) == "hit", "Hit", df$Result)
+
+df$Result <- ifelse(
+  grepl("^differs\\s*from\\s*wt\\s*only$", tolower(df$Result)),
+  "Differs from WT only",
+  df$Result
+)
+
+df$Result <- ifelse(tolower(df$Result) == "inconclusive", "Inconclusive", df$Result)
+
+# ---- Plot status (3-level color scheme) ----
+df$Plot_status <- df$Result
+df$Plot_status[!(df$Plot_status %in% c("Hit", "Differs from WT only", "Inconclusive"))] <- "Inconclusive"
+
+df$Plot_status <- factor(
+  df$Plot_status,
+  levels = c("Inconclusive", "Differs from WT only", "Hit")
+)
+
+# ---- Assay factor ----
+df$assay <- trimws(df$assay)
+assay_order <- c(
+  "Within 4 Body Lengths",
+  "3 Nearest Neighbors",
+  "Nearest Neighbor",
+  "Global Average"
+)
+
+df$Assay <- factor(df$assay, levels = assay_order)
+
+#df$Assay <- factor(df$assay, levels = unique(df$assay))
+
+# ---- Build per-assay forest plots ----
+plot.f <- list()
+
+for (a in levels(df$Assay)) {
+
+  plot.t <- df[df$Assay == a, ]
+
+  # order genes within each assay by estimate (low -> high)
+  plot.t$genotype <- factor(
+    plot.t$genotype,
+    levels = plot.t$genotype[order(plot.t$estimate)]
+  )
+
+  plot.f[[a]] <- ggplot(
+    plot.t,
+    aes(x = genotype, y = estimate, color = Plot_status)
+  ) +
+    geom_linerange(
+  aes(ymin = lower.CL, ymax = upper.CL),
+  linewidth = 0.5
+) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.45) +
+    scale_color_manual(
+      values = c(
+        "Inconclusive" = "bisque2",
+        "Differs from WT only" = "grey40",
+        "Hit" = "red"
+      )
+    ) +
+    coord_flip() +
+    theme_prism(base_size = 30) +
+    theme(
+      axis.line.x = element_line(linewidth = 0.4),
+      axis.line.y = element_line(linewidth = 0.4),
+      axis.ticks.x = element_line(linewidth = 0.3),
+      axis.ticks.y = element_line(linewidth = 0.3),
+      axis.text.y  = element_text(size = 20, face = "plain"),
+      axis.text.x  = element_text(face = "plain"),
+      axis.title.x = element_text(face = "plain"),
+      plot.title = element_text(size = 35, face = "plain", hjust = 0.5),
+      legend.position = "none"
+    ) +
+    labs(
+      title = a,          # <-- original behavior: use assay name directly
+      y = "Mean diff",
+      x = ""
+    )
+}
+
+p_forest <- wrap_plots(plot.f, ncol = 4)+
+  plot_annotation(
+    title = "Females
+    ",
+    theme = theme(
+      plot.title = element_text(
+        face = "plain",
+        size = 45,
+        hjust = 0.5   # center the title
+      )
+    )
+  )
+
+p_forest
+
+ggsave(
+  filename = "forest_plot_females_SD_status_colored.pdf",
+  plot = p_forest,
+  width = 30,
+  height = 25,
+  units = "in",
+  device = "pdf"
+)
+
+# ---- Export ranked order by estimate for each assay ----
+orders_df <- do.call(rbind, lapply(split(df, df$assay), function(dfi) {
+
+  dfi <- dfi[order(dfi$estimate, decreasing = TRUE), ]  # high -> low
+
+  data.frame(
+    assay = unique(dfi$assay),
+    genotype = dfi$genotype,
+    estimate = dfi$estimate,
+    lower.CL = dfi$lower.CL,
+    upper.CL = dfi$upper.CL,
+    Result = dfi$Result,
+    display_rank = seq_len(nrow(dfi)),
+    stringsAsFactors = FALSE
+  )
+}))
+
+write.csv(
+  orders_df,
+  "all_assays_gene_order_by_estimate_females_SD.csv",
+  row.names = FALSE
+)df <- read.csv("females_SD.csv", stringsAsFactors = FALSE)
+
+# ---- Clean / standardize Result labels ----
+df$Result <- trimws(df$Result)
+
+df$Result <- ifelse(tolower(df$Result) == "hit", "Hit", df$Result)
+
+df$Result <- ifelse(
+  grepl("^differs\\s*from\\s*wt\\s*only$", tolower(df$Result)),
+  "Differs from WT only",
+  df$Result
+)
+
+df$Result <- ifelse(tolower(df$Result) == "inconclusive", "Inconclusive", df$Result)
+
+# ---- Plot status (3-level color scheme) ----
+df$Plot_status <- df$Result
+df$Plot_status[!(df$Plot_status %in% c("Hit", "Differs from WT only", "Inconclusive"))] <- "Inconclusive"
+
+df$Plot_status <- factor(
+  df$Plot_status,
+  levels = c("Inconclusive", "Differs from WT only", "Hit")
+)
+
+# ---- Assay factor ----
+df$assay <- trimws(df$assay)
+assay_order <- c(
+  "Within 4 Body Lengths",
+  "3 Nearest Neighbors",
+  "Nearest Neighbor",
+  "Global Average"
+)
+
+df$Assay <- factor(df$assay, levels = assay_order)
+
+#df$Assay <- factor(df$assay, levels = unique(df$assay))
+
+# ---- Build per-assay forest plots ----
+plot.f <- list()
+
+for (a in levels(df$Assay)) {
+
+  plot.t <- df[df$Assay == a, ]
+
+  # order genes within each assay by estimate (low -> high)
+  plot.t$genotype <- factor(
+    plot.t$genotype,
+    levels = plot.t$genotype[order(plot.t$estimate)]
+  )
+
+  plot.f[[a]] <- ggplot(
+    plot.t,
+    aes(x = genotype, y = estimate, color = Plot_status)
+  ) +
+    geom_linerange(
+  aes(ymin = lower.CL, ymax = upper.CL),
+  linewidth = 0.5
+) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.45) +
+    scale_color_manual(
+      values = c(
+        "Inconclusive" = "bisque2",
+        "Differs from WT only" = "grey40",
+        "Hit" = "red"
+      )
+    ) +
+    coord_flip() +
+    theme_prism(base_size = 30) +
+    theme(
+      axis.line.x = element_line(linewidth = 0.4),
+      axis.line.y = element_line(linewidth = 0.4),
+      axis.ticks.x = element_line(linewidth = 0.3),
+      axis.ticks.y = element_line(linewidth = 0.3),
+      axis.text.y  = element_text(size = 20, face = "plain"),
+      axis.text.x  = element_text(face = "plain"),
+      axis.title.x = element_text(face = "plain"),
+      plot.title = element_text(size = 35, face = "plain", hjust = 0.5),
+      legend.position = "none"
+    ) +
+    labs(
+      title = a,          # <-- original behavior: use assay name directly
+      y = "Mean diff",
+      x = ""
+    )
+}
+
+p_forest <- wrap_plots(plot.f, ncol = 4)+
+  plot_annotation(
+    title = "Females
+    ",
+    theme = theme(
+      plot.title = element_text(
+        face = "plain",
+        size = 45,
+        hjust = 0.5   # center the title
+      )
+    )
+  )
+
+p_forest
+
+ggsave(
+  filename = "forest_plot_females_SD_status_colored.pdf",
+  plot = p_forest,
+  width = 30,
+  height = 25,
+  units = "in",
+  device = "pdf"
+)
+
+# ---- Export ranked order by estimate for each assay ----
+orders_df <- do.call(rbind, lapply(split(df, df$assay), function(dfi) {
+
+  dfi <- dfi[order(dfi$estimate, decreasing = TRUE), ]  # high -> low
+
+  data.frame(
+    assay = unique(dfi$assay),
+    genotype = dfi$genotype,
+    estimate = dfi$estimate,
+    lower.CL = dfi$lower.CL,
+    upper.CL = dfi$upper.CL,
+    Result = dfi$Result,
+    display_rank = seq_len(nrow(dfi)),
+    stringsAsFactors = FALSE
+  )
+}))
+
+write.csv(
+  orders_df,
+  "all_assays_gene_order_by_estimate_females_SD.csv",
+  row.names = FALSE
+)
+
+```
+
